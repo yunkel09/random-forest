@@ -1,0 +1,1173 @@
+---
+title: Árboles de Decisión
+subtitle: Ejercicio Obligatorio
+author:
+- name: William Chavarría
+  affiliation: Máxima Formación
+  email: wchavarria@tigo.com.gt
+date: '`r format(Sys.Date())`'
+output: 
+  bookdown::html_document2:
+    toc: true
+    toc_float: true
+    highlight: pygments
+    theme: spacelab
+    css: custom.css
+    fig_caption: true
+    df_print: paged
+bibliography: [paquetes.bib, arboles.bib]
+biblio-style: "apalike"
+link-citations: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo        = TRUE, 
+                      include     = TRUE,
+                      cache       = FALSE,
+                      fig.align   = 'center',
+                      message     = FALSE,
+                      warning     = FALSE, 
+                      comment     = NA, 
+                      highlight   = TRUE,
+                      strip.white = TRUE,
+                      dev         = "svglite",
+                      fig.width   = 8,
+                      fig.asp     = 0.618,
+                      fig.show    = "hold",
+                      fig.align   = "center")
+```
+
+# Bike {.tabset .tabset-fade .tabset-pills}
+
+## Descripción
+
+Datos Bike Sharing Database. Se desea realizar un modelo para predecir el número
+de bicicletas que se van a alquilar (Variable cnt). Se nos proporciona un
+conjunto de datos con 731 observaciones y 10 variables, donde la variable cnt es
+la variable a predecir. Realice los siguientes pasos para la construcción del
+modelo:
+
+1. Cargar los datos y transformar aquellas variables que se consideren factor. 
+2. Compruebe si la variable dependiente sigue una distribución normal
+(simetría). Realice una transformación si es necesario.
+3. Realice todo el pre-procesado de datos dividiendo el conjunto de datos en uno
+de entrenamiento y otro de validación (70%-30% de las observaciones).
+4. Realice un modelo de Random Forest. Optimice el número de árboles y variables
+del modelo y realice una predicción sobre el conjunto de validación.
+5. Realice un modelo de xgboost con la mejor iteración y realice una predicción
+sobre el conjunto de validación.
+6. Utilice la métrica de RMSE. Interprete los resultados, ¿Cuál de los dos
+modelos obtiene mejores resultados?
+
+Los datos se encuentran dentro un archivo denominado bike.csv. Conjunto de datos
+modificado de la UCI Machine Learning Repository denominado Bike Sharing
+Database. El conjunto original está compuesto por 16 variables.
+
+Descripción de las variables:
+
+- season: Estación del año (1: invierno, 2: primavera, 3: verano, 4: otoño).
+- mnt: Mes del año codificado en número.
+- holiday: Indica día festivo o no festivo (0: laborable, 1: Festivo).
+- weekday: Día de la semana.
+- workingday: Indica si el día es o no laborable.
+- weathersit: Situación meteorológica.
+- temp: Temperatura (ºC).
+- hum: Humedad.
+- windspeed: Velocidad del viento.
+- cnt: Número de bicicletas alquiladas
+
+
+## Paquetes
+
+```{r}
+options(warn = -1,
+		  dplyr.summarise.inform = FALSE,
+		  tibble.print_min = 5,
+		  readr.show_col_types = FALSE)
+```
+
+```{r}
+import::from(caret, train, trainControl)
+qq <- import::from(qqplotr, .all = TRUE, .into = {new.env()})
+import::from(magrittr, "%T>%", "%$%", .into = "operadores")
+import::from(nortest, ad.test, pearson.test, sf.test, lillie.test)
+import::from(zeallot, `%<-%`)
+import::from(moments, skewness)
+import::from(bestNormalize, bestNormalize)
+import::from(corrplot, corrplot)
+import::from(DescTools, JarqueBeraTest)
+import::from(vip, vip)
+import::from(statistigo, coloring_font)
+import::from(skimr, skim)
+import::from(weights, rd, starmaker)
+import::from(cowplot, .except = "stamp")
+import::from(kableExtra, .except = "group_rows")
+import::from(car, .except = c("recode", "some"))
+import::from(patchwork, plot_layout, plot_annotation)
+import::from(GGally, ggpairs, wrap)
+import::from(DataExplorer, plot_intro, plot_bar, plot_density)
+import::from(conectigo, cargar_fuentes)
+import::from("janitor", make_clean_names)
+
+pacman::p_load(colorspace,
+					colorblindr,
+					kableExtra,
+					textrecipes,
+					# tictoc,
+					rlang,
+					usemodels,
+					tidymodels,
+					finetune,
+					tidyverse)
+```
+
+
+## Funciones
+
+```{r}
+# agregar línea loess a las gráficas ggpairs
+loess_lm <- function(data, mapping, ...){
+ 
+ggplot(data = data, mapping = mapping) + 
+    geom_point(alpha = 0.9) + 
+    stat_smooth(formula = y ~ x, 
+                method = "lm", 
+                se = TRUE, 
+                color = "blue",
+                fill = "blue",
+                size = 0.5, 
+                alpha = 0.2,
+                linetype = "longdash", 
+                ...)
+}
+```
+
+```{r}
+tabla <- function(df, cap = "prueba") {
+  
+  df %>% 
+   kbl(booktabs = TRUE, caption = cap, escape = F) %>% 
+   kable_paper(lightable_options = "hover", full_width = F)}
+```
+
+```{r}
+formatear_df <- function(df, pval) {
+	
+	pv <- df[[pval]]
+	
+	df %>% 
+		mutate(
+			across(where(is.numeric), round, 4),
+			across(.data[[pval]], rd, 2),
+			sig = starmaker(x = pv, p.levels = c(.001, .01, .05, .1), 
+								 symbols = c("***", "**", "\\*", "\\+")))
+}
+```
+
+```{r}
+# generar gráfico de densidad
+estimar_densidad <- function(df, d, color) {
+	
+	brk <- hist(df[[d]], plot = FALSE)$breaks 
+	med <- mean(df[[d]])
+	
+	df %>% 
+	  ggplot(aes(x = .data[[d]], y = ..density..)) +
+	  geom_histogram(fill   = color,
+	                 colour = "black",
+	                 size   = .2,
+	                 breaks = brk) +
+	  scale_x_continuous(name   = d,
+	                     breaks = brk) +
+	  geom_density(size = 1) +
+	  geom_vline(xintercept = med, 
+	             linetype = "dashed",
+	             color = "red", 
+	             alpha = 0.5) 
+}
+```
+
+```{r}
+# crear qq-plots
+qpl <- function(df, var_y, rel) { 
+      
+      df %>% 
+       ggplot(aes(sample = .data[[var_y]])) +
+       qq$geom_qq_band(bandType = "pointwise", 
+                       distribution = "norm", 
+                       alpha = 0.5) +
+       qq$stat_qq_line() +
+       qq$stat_qq_point(size   = 2, 
+                        shape  = 21, 
+                        alpha  = 0.8, 
+                        fill   = rel, 
+                        colour = rel) +
+       labs(x = "Theoretical Quantiles", y = "Sample Quantiles") +
+       ggtitle(str_to_title(var_y)) +
+       theme(plot.title = element_text(size = 16))
+      
+     }
+```
+
+
+```{r}
+# pruebas de normalidad no paramétrica
+funciones <- list(
+ 
+  shapiro_wilk       = function(x) shapiro.test(x),
+  jarque_bera        = function(x) JarqueBeraTest(x, robust = F),
+  pearson            = function(x) pearson.test(x), 
+  shapiro_francia    = function(x) sf.test(x),
+  kolgomoro_smirnov  = function(x) lillie.test(x)
+)
+```
+
+```{r}
+# aplicar pruebas de normalidad
+probar_normalidad <- function(vector) {
+	
+	funciones %>% 
+		map(exec, x = vector) %>% 
+		map_df(tidy) %>% 
+		select(method, p_value = p.value) %>% 
+		# mutate(normalidad = ifelse(p_value < 0.05, "NO_NORMAL", "NORMAL")) %>% 
+		arrange(desc(p_value))
+}
+```
+
+```{r}
+resaltar <- function(texto) {
+    
+    glue::glue("<span style='background-color: #FFFF00'>**{texto}**</span>")
+    
+}
+```
+
+## Metricas
+
+La fórmula del RMSLE es:
+
+$$\sqrt{\frac{1}{n}\sum_{i = 1}^{n} (log(x_{i} + 1) - log(y_{i} + 1))^2}$$
+
+Donde X es el valor predecido y Y es el valor actual
+
+En el caso de RMSE, la presencia de valores atípicos puede hacer explotar el
+término de error a un valor muy alto. Pero, en el caso de RMLSE, los valores
+atípicos se reducen drásticamente, lo que anula su efecto.
+
+Lo que sucede es que el RMSE se va a incrementar con la presencia de atípicos,
+en cambio el **RMSLE no se afecta mucho**. El RMSLE es un error relativo.
+
+Otro aspecto a considerar es que el RMSE aumenta si las medidas entre las
+predicción y el valor actual son grandes. En cambio RMSLE es un valor relativo.
+
+El factor más importante para utilizar el RMSLE es que RMSLE incurre en una
+penalización mayor por la subestimación de la variable real que la
+sobreestimación. En palabras simples, se incurre en más penalización cuando el
+valor predicho es menor que el valor real. Por otro lado, se incurre en menos
+penalización cuando el valor predicho es mayor que el valor real.
+
+Esto es especialmente útil para casos en los que la subestimación de la variable
+objetivo no es aceptable, pero se puede tolerar la sobreestimación.
+
+Supongamos que sobrestimamos la renta de bicicletas, el adminstrador puede
+tener más bicicletas disponibles para atender la demanda suponiendo que el costo
+de mantener más bicicletas es menor que el costo de no rentarlas.  El problema
+se daría si la cantidad de bicicletas predichas es menor, en este caso es
+probable que el administrador pierda dinero por no tener suficientes bicicletas
+para suplir la demanda.
+
+```{r}
+# métrica rmsle
+rmsle_vec <- function(truth, estimate, na_rm = TRUE, ...) {
+  
+	rmsle_impl <- function(truth, estimate) {
+    sqrt(mean((log(truth + 1) - log(estimate + 1))^2))
+  }
+
+  metric_vec_template(
+    metric_impl = rmsle_impl,
+    truth = truth,
+    estimate = estimate,
+    na_rm = na_rm,
+    cls = "numeric",
+    ...
+  )
+}
+
+rmsle <- function(data, ...) {
+  UseMethod("rmsle")
+}
+rmsle <- new_numeric_metric(rmsle, direction = "minimize")
+
+rmsle.data.frame <- function(data, truth, estimate, na_rm = TRUE, ...) {
+  metric_summarizer(
+    metric_nm = "rmsle",
+    metric_fn = rmsle_vec,
+    data = data,
+    truth = !!enquo(truth),
+    estimate = !!enquo(estimate),
+    na_rm = na_rm,
+    ...
+  )
+}
+```
+
+## Opciones
+
+```{r}
+cargar_fuentes()
+```
+
+```{r}
+yunkel <- theme_cowplot(font_family = "yano") +
+	       theme(plot.margin = unit(c(3, 1, 1, 1), "mm"), 
+	             axis.title = element_text(size = 12))
+```
+
+```{r}
+# tema con grid horizontal y vertical
+drako <- theme_bw(base_family = "yano", base_size = 14) +
+	      theme(plot.margin = unit(c(6, 1, 1, 1), "mm"),
+	            axis.title = element_text(size = 12),
+	            plot.subtitle = element_text(size = 8,
+                                            family = "sans"))
+```
+
+```{r}
+theme_set(yunkel)
+```
+
+# Carga
+
+Cargar los datos y transformar aquellas variables que se consideren factor.
+
+```{r}
+# ruta <- fs::path_wd("05_arboles", "bike", ext = "csv")
+# bike <- read_csv(ruta, col_types = "ffffffdddi", lazy = FALSE)
+bike <- read_csv("bike.csv", col_types = "ffffffdddi", lazy = FALSE)
+```
+
+# Análisis Exploratorio
+
+## Estructura
+
+```{r}
+head(bike)
+```
+
+Se observa que la conversión a factor se realizó desde la carga.
+
+```{r}
+dim(bike)
+```
+
+```{r}
+plot_intro(bike, ggtheme = yunkel)
+```
+
+Ninguna de nuestras variables tiene datos ausentes en ninguno de los dos
+conjuntos de datos. El 40% de las columnas (4) son numéricas y el restante 60%
+son categóricas.
+
+```{r}
+bike %>%
+	skim() %>%
+	as_tibble() %>%
+	select(skim_type:numeric.sd)
+```
+
+La media de bicicletas rentadas es de `r round(mean(bike$cnt), 2)` por día en un
+periodo de 730 días que van del 01 de enero de 2011 al 31 de diciembre de 2012.
+Podemos observar la distribución de frecuencias de los predictores categóricos
+en la columna `factor.top_counts` donde vemos que `season`, `mnth` y `weekday`
+se encuentran bastante balanceados, sin embargo el resto de variables discreteas
+presenta un desbalance que debemos estudiar.
+
+Ahora veamos si tenemos medidas repetidas
+
+```{r}
+bike  %>% janitor::get_dupes(mnth, weekday) %>% head()
+```
+
+Vemos que tenemos medidas repetidas el mismo día y mes.  Esto podría suceder
+debido a que se omitió la columna de fecha y probablemente estas mediciones
+correspondan a diferentes años.  Para comprobarlo descargamos el archivo original
+de `r statistigo::coloring_font("UCI Machine Learning Repository", "red")` y
+dejamos la columna fecha y año para comprobar.
+
+```{r}
+# ruta2 <- fs::path_wd("05_arboles", "day", ext = "csv")
+# bike_uci <- read_csv(ruta2, col_types = cols_only(
+bike_uci <- read_csv("day.csv", col_types = cols_only(
+	
+  dteday     = col_date(format = "%Y-%m-%d"),
+  season     = col_factor(),
+  yr         = col_factor(),
+  mnth       = col_factor(),
+  holiday    = col_factor(),
+  weekday    = col_factor(),
+  workingday = col_factor(),
+  weathersit = col_factor(),
+  temp       = col_double(),
+  hum        = col_double(),
+  windspeed  = col_double(),
+  cnt        = col_integer()), lazy = FALSE)
+```
+
+```{r}
+bike_uci %>% janitor::get_dupes(dteday, yr, mnth, weekday)
+```
+
+```{r, echo=FALSE}
+c(fi, ff) %<-% (bike_uci %$% range(dteday))
+difftime(ff, fi, units = "days")
+```
+
+Logramos comprobar que no hay medidas repetidas el mismo día. 
+
+> El problema de tener medidas repetidas es que se podrían distribuir tanto en
+el conjunto de entrenamiento como en el de prueba y hacerlo podría inflar
+artificialmente nuestras estimaciones de rendimiento.
+
+## Variables dependiente
+
+```{r}
+brk <- hist(bike[["cnt"]], plot = FALSE)$breaks
+
+bike %>% 
+	ggplot(aes(x = cnt, y = ..density..)) +
+	geom_histogram(fill   = "gray40",
+	               colour = "black",
+	               size   = .2,
+						bins = 30) +
+	geom_density(size = 0.5) +
+	labs(title = "Distribución de la variable cantidad de bicicletas rentadas") +
+	drako
+```
+
+Podemos decir que una distribución, o conjunto de datos, es simétrico si se ve
+igual a la izquierda y a la derecha del punto central como en este caso, al
+menos visualmente. Podemos utilizar una medida de simetría para comprobarlo bajo
+el supuesto de que la simetría para un distribución normal es cero. Las crestas
+laterales podrían ser un indicio de multimodalidad.
+
+Una distribución es simétrica si tiene un *skewness* cercano a cero.
+
+```{r, paged.print = FALSE}
+bike %>% 
+	keep(is.numeric) %>% 
+	map_dbl(skewness) %>% 
+	enframe(name = "variable", value = "asimetria") %>% 
+	tabla(cap = "Skewnees")
+```
+
+El valor de la variable respuesta es bastante cercano a cero por lo que
+**una transformación no es necesaria** [@kuhn_applied_2013 pag 70]
+
+## Variables cuantitativas
+
+```{r}
+bike_n <- bike %>% select(where(is.numeric))
+pal    <- palette_OkabeIto[1:ncol(bike_n)]
+ndv    <- rev(names(bike_n))
+```
+
+(ref:densidad) Histograma con densidad
+
+```{r, densidad, fig.cap='(ref:densidad)', fig.width=11, fig.asp=0.7}
+map2(.x = ndv, .y = pal, ~ estimar_densidad(df = bike_n, d = .x, color = .y)) %>% 
+ reduce(.f = `+`) + 
+ plot_layout(ncol = 2) +
+ plot_annotation(title    = "Distribución", 
+                 subtitle = "Estimación de densidad no paramétrica") 
+```
+\
+En la figura \@ref(fig:densidad) vemos la distribución de
+la variable respuesta *cnt* y las variables independientes. 
+
+* **windspeed:** Presenta una asimetría positiva (sesgada a la derecha)
+
+* **hum:** Presenta una asimetría negativa (sesgada a la izquierda).
+
+* **temp:** Presenta una curva de frecuencia multimodal en que vemos dos máximos.
+
+
+En la parte de preprocesado probaremos los modelos con las variables
+independientes transformadas y sin transformar siguiendo
+[estas](https://bit.ly/3snRZtD) recomendaciones y las transformaciones definidas
+en [@kuhn_applied_2013 pag 69] para solucionar asimetrías en los predictores.
+
+(ref:cuantiles) QQ-Plot variables numéricas
+
+```{r, cuantiles, fig.cap = '(ref:cuantiles)', fig.width=11, fig.asp=0.7}
+map2(.x = ndv, .y = pal, ~ qpl(df = bike_n, var_y = .x, rel = .y)) %>%
+ reduce(.f = `+`) +
+ plot_layout(ncol = 2) +
+ plot_annotation(title = "Comparación de cuantiles", 
+                 subtitle = "qq-plots")
+```
+
+En la figura \@ref(fig:cuantiles) se ve que las colas de la variable respuesta
+se salen un poco de los intervalos de confianza.
+
+Realicemos pruebas no paramétricas para evaluar la normalidad de las variables.
+
+```{r, normalidad}
+bike_n %>% 
+	imap_dfr(~ probar_normalidad(.x) %>%
+				mutate(var = .y)) %>% 
+	pivot_wider(names_from = "var", values_from = "p_value") %>% 
+	mutate(across(where(is.numeric), rd, 2)) %>% 
+	tabla(cap = "Pruebas no paramétricas de normalidad")
+```
+\
+
+**Normalidad:** En el primer cuadrante de la figura \@ref(fig:densidad) vemos
+que la variable respuesta aparenta ser bastante simétrica sin valores atípicos,
+sin embargo en la figura \@ref(fig:cuantiles) vemos como las colas se salen de
+los límites. En la tabla \@ref(tab:normalidad) se realizaron varias pruebas no
+paramétricas y comprobamos que **la variable respuesta no es normal.**. Lo
+mismo para el resto de variables numéricas. La excepción se encuentra en la
+prueba de Jarque Bera y la prueba de Pearson que dan resultados arriba del
+nivel de confianza sugiriendo normalidad en la variable temperatura.
+
+## Variables categóricas
+
+Ahora veamos como se distribuyen las variables categóricas, primero a nivel
+de frecuencia general y luego en función de la variable dependiente. Para hacer
+el proceso de graficado más sencillo utilizaremos el la función `plot_bar` del
+paquete {DataExplorer}.  
+
+(ref:desbalance) Frecuencia de variables categóricas
+
+```{r, desbalance, fig.cap='(ref:desbalance)', fig.width=11, fig.asp=0.7}
+plot_bar(bike, ggtheme = drako)
+```
+
+Dependiendo de los modelos, es probable que debamos eliminar las variables que
+son muy escasas y desequilibradas, como las que se ven en la figura través de un
+filtro de *near-zero variance*.
+
+(ref:funcontinua) Distribución de las variables categóricas en función de CNT
+
+```{r, funcontinua, fig.cap='(ref:funcontinua)', fig.width=11, fig.asp=0.7}
+plot_bar(bike, with = "cnt", ggtheme = drako)
+```
+
+* **holiday:** Vemos que la renta de bicicletas no se ve influida por si el día
+es feriado (holiday) así que en principio no sería una variable que pudiera
+influir en nuestro modelo.
+
+* **weathersit:** En el caso del clima, se observa que hay poca renta cuando el
+clima presenta lluvia o nieve ligera, así que la relación estaría más con el
+nivel de la variable `weathersit` que corresponde a días despejados (1).
+
+* **workingday:** La mayor parte de las rentas se dan en días normales o
+laborales.
+
+* **weekday:** Casi no hay diferencia entre los distintos días de la semana y la
+cantidad de bicicletas rentadas.
+
+* **mnth:** La relación entre mes y rentas se observan diferencias. Los meses de
+junio a septiembre es donde se dan más renta de bicicletas. Dependiendo del
+país donde se recolectaron estos datos, estos meses podrían corresponder a la
+estación de verano ya que la variable *season* muestra una mayor renta en 3.
+
+* **season:** Vemos que si hay una diferencia entre las distintas estaciones,
+siendo verano la estación en que se dan más rentas.
+
+Exploremos un poco más los meses del año.
+
+```{r}
+meses <- month.name %>% enframe() %>% deframe()
+```
+
+(ref:est) Renta de bicicletas por mes
+
+```{r est, fig.cap='(ref:est)'}
+bike %>% 
+	mutate(across(mnth, recode, !!!meses)) %>% 
+	ggplot(aes(mnth, cnt, color = mnth)) +
+	geom_boxplot() +
+	geom_jitter(alpha = 0.1, width = 0.15) +
+	labs(x = NULL, y = "Biciletas rentadas") +
+	theme(legend.position = "none")
+```
+\
+En la gráfica \@ref(fig:est) vemos una clara estacionalidad en la renta de
+bicicletas, siendo los meses del año junio y julio los que presentan una mayor
+cantidad de rentas.  A como observamos al inicio, no se aprecian valores
+atípicos y hay poca variación entre los meses.  Lo importante de estas gráficas
+es comprender de que forma estos predictores contribuirán al modelo en la
+determinación de la cantidad de renta de bicicletas. **El mes del año puede
+ser un buen predictor de la renta de bicicletas, aunque podría ser una
+variable de confusión con la temperatura, ya que en los meses de mayor renta
+podrian ser los más calurosos**
+
+## Correlación
+
+En el siguiente apartado revisaremos si existen relaciones **lineales** entre
+los predictores y la respuesta y entre los mismos predictores.
+
+(ref:cormatriz) Matriz de correlación
+
+```{r, cormatriz, fig.cap='(ref:cormatriz)'}
+corm <- cor(bike[, 7:10])
+corrplot(corr = corm,
+			method = "color",
+			order = "hclust",
+			type = "upper",
+         addCoef.col = "black",
+         outline = F,
+         diag = TRUE, 
+         col = colorRampPalette(c("deepskyblue1","white","indianred3"))(100), 
+         tl.cex = 0.8, number.cex = 1, cl.cex = 1, tl.col = "black", 
+         tl.pos = "td", tl.srt = 45)
+```
+
+En el gráfico \@ref(fig:cormatriz) los cuadros azules indican correlación
+negativa y los rojos correlación positiva. Según la intensidad del color la
+correlación es más fuerte o más débil.  En la diagonal se sitúa la correlación
+de la variable consigo misma.
+
+```{r}
+caret::findCorrelation(corm, cutoff = 0.75)
+```
+
+Algunos modelos podrían beneficiarse de una decorrelación (eliminar
+colinealidad) de predictores o en palabras más sencillas, cuando dos variables
+predictoras están altamente correlacionadas debemos eliminar una de ellas para
+eliminar información redundante [@garcia_visualizacion_2020 pag 15].
+
+Vemos en la gráfica \@ref(fig:cormatriz) que no hay predictores que estén
+correlacionados entre ellos por arriba de un umbral de 0.75.  Este umbral es
+sugerido por [@kuhn_applied_2013 pag 87]
+
+(ref:matriz) Gráfico de correlación
+
+```{r, matriz, fig.cap='(ref:matriz)', fig.width=12, fig.asp=0.7}
+bike %>%
+	select(where(is.numeric)) %>% 
+	ggpairs(., lower = list(continuous = loess_lm),
+ 		     upper = list(continuous = wrap("cor", size = 5))) + drako
+```
+\
+Algo que podríamos esperar es que veamos una relación fuerte entre la
+temperatura y la renta de bicicletas. En la figura \@ref(fig:matriz) vemos que
+esto es así. Veámoslo un poco mejor. Combinemos la temperatura y la humedad
+relativa dado de que la sensación térmica es una relación entre ambas.  
+
+```{r}
+bike %>% 
+	ggplot(aes(x = cnt, y = temp)) +
+	geom_point(size = 2.5, 
+				  alpha = 0.7,
+				  aes(color = hum)) +
+	scale_color_viridis_c() +
+	stat_smooth(formula = y ~ x,
+					method = "lm",
+					se = FALSE,
+					color = "grey",
+					size = 0.5) +
+	labs(title = "Relación entre la temperatura y la cantidad de bicicletas rentadas",
+		  subtitle = "Considerar temperatura y humedad")
+```
+
+Se observa una relación lineal entre la temperatura y la cantidad de bicicletas
+rentadas. La relación es positiva y fuerte, con algo de dispersión, sin
+presencia de valores atípicos aparentes.  Se observan menos puntos amarillos
+(mayor humedad relativa) a medida que la temperatura aumenta. Esto tiene sentido
+dada la relación de la humedad y temperatura, pero también el hecho de una
+alta humedad relativa se puede traducir en una sensación térmica mayor y esto
+podría impactar la renta de bicicletas si hace más calor. **La temperatura será
+un buen predictor de la renta de bicicletas.**
+
+# Framework
+
+Hay algunos paquetes R existentes que proporcionan una interfaz unificada para
+armonizar para trabajar con Machine Learning, tales como caret y mlr. El marco
+tidymodels es similar a estos en la adopción de una unificación de la interfaz
+de función, así como en la aplicación de coherencia en los nombres de las
+funciones y los valores de retorno. Es diferente en sus obstinados objetivos de
+diseño e implementación de modelos.
+
+<p class="comment">
+Se reconoce^[ver [usemodels](https://bit.ly/3s5tvW3)] que el uso de este marco
+de trabajo (tidymodels) `r resaltar("podría implicar una mayor cantidad de
+código del que se habría tenido que escribir en comparación con un paquete como
+caret. Sin embargo, el ecosistema tidymodels permite una variedad más amplia de
+técnicas de modelado y es más versátil.")`
+</p>
+
+Dentro de este framework utilizaremos algo denominado *model workflow* en el
+que se incluyen todas las operaciones que se realizan antes y después del ajuste
+del modelo. Es decir, el workflow se refiere a una
+serie de pasos que implica tareas de preprocesamiento, ajuste del modelo y
+tareas de post-procesamiento, por lo que no veremos el preprocesamiento como
+un paso previo al ajuste del modelo, sino como un todo, como parte del workflow.
+
+# División
+
+Con base a lo especificado por [@kuhn_tidy_2021] para los problemas de
+regresión, los datos de los resultados se pueden agrupar artificialmente en
+cuartiles y luego realizar un muestreo estratificado con el parámetro `strata`
+El autor indica que este es un método eficaz para mantener similares las
+distribuciones del resultado entre el conjunto de entrenamiento y prueba.
+
+```{r}
+bike_split <- initial_split(data = bike, strata = cnt, prop = 0.7)
+bike_train <- training(bike_split)
+bike_test  <- testing(bike_split)
+```
+
+```{r}
+dim(bike_train) # 70% para entrenamiento
+```
+
+```{r}
+set.seed(2021)
+bike_fold <- vfold_cv(bike_train, strata = cnt)
+```
+
+La explicación del porque estratificar la variable respuesta (numérica continua)
+es que debido a que no tiene una distribución normal si simplemente utilizamos
+muestreo aleatorio se podría dar el caso que los datos de entrenamiento los
+casos de cantidades de rentas extremas (altas o bajas) no estén bien
+representadas en este conjunto y por lo tanto la predicción de nuestro modelo
+será deficiente.
+
+<!-- El parámetro `repeats` lo utilizaremos para reducir el ruido. -->
+
+```{r, paged.print = FALSE}
+bike_fold
+```
+
+# Modelado
+
+En esta parte vamos a especificar nuestros modelos. El de Random Forest y el de
+Xgboost.  A esto le llamaremos *especificaciones* e incluyen el afinamiento
+de los hiperparámetros (_tuning_)
+
+Observar que especificaremos los modelos con las funciones del paquete {tune}.
+Esto significa que en el proceso de ajuste del modelo estos parámetros se
+ajustarán con base a la cuadrícula de búsqueda que definamos (_grid_search_).
+
+## Random Forest
+
+Este modelo no requiere procesamiento previo^[[Apéndice
+A](https://bit.ly/3mR18aW)], por lo que se puede utilizar una fórmula simple.
+Random Forest requiere imputación, pero debido a que vimos que no hay valores
+ausentes, no aplicaremos el paso de imputación.
+
+El parámetro de ajuste principal para los modelos de RF es el número de columnas
+de predicción que se muestrean aleatoriamente para cada división en el árbol,
+generalmente denotado como `mtry()`. Sin conocer el número de predictores, este
+rango de parámetros **no se puede preconfigurar y requiere finalización.**,
+aunque sabemos con base a [@kuhn_applied_2013 pag 287] que el valor por defecto
+del $m_{try} = P/3$. En todo caso, dejaremos el valor por defecto y en el
+proceso de ajuste este parámetro se calculará automáticamente.
+
+```{r}
+rf_spec <- rand_forest(mtry  = tune(), min_n = tune(), trees = 1000) %>%
+	set_engine("ranger", oob.error = TRUE) %>%
+	set_mode("regression")
+```
+
+`tune()` es un marcador de posición para los valores que esperan ser ajustados.
+Lo que significa que al momento de realizar el ajuste contra todos los pliegos
+(folds) `rf_spec` probará diferentes parámetros a través de una cuadrícula de
+búsqueda y encontrar la mejor combinación.
+
+A como mencionamos en el apartado de análisis exploratorio, lo mejor será
+probar los modelos con diferentes transformaciones, aunque sabemos que los
+modelos basados en árboles son insensibles a las características de los
+predictores, realizaremos la pruebas para efectos didácticos. 
+
+* **receta_rf_simple:** Todos los predictores sin transformaciones.
+
+* **receta_rf_ce:** Todos los predictores numéricos centrados y escalados.
+
+* **receta_rf_cetr:** Todos los predictores numéricos con transformaciones para
+corregir las asimetrías.
+
+* **receta_rf_cetrplus:** Todas las transformaciones posibles a todos los
+predictores.
+
+
+```{r}
+receta_rf <- recipe(cnt ~ ., data = bike_train)
+
+receta_rf_ce <- recipe(cnt ~ ., data = bike_train) %>% 
+	step_normalize(all_numeric_predictors())
+```
+
+Trataremos de identificar la mejor transformación para cada predictor
+utilizando el paquete {bestNormalize} ([@R-bestNormalize]) el cual es posible
+aplicar a través de la función `step_best_normalize` a como se define en el
+artículo de [@bestNormalize2021]
+
+
+```{r}
+bike_transformado <- recipe(cnt ~ ., data = bike_train) %>%
+	step_best_normalize(all_predictors(), -all_nominal()) %>%  
+	prep(bike_train) %>% 
+   bake(bike_train)
+```
+
+```{r}
+validar_transformacion <- function(.df, .var) {
+	
+	.df %>% 
+		select(temp_tr = .data[[.var]]) %>% 
+		bind_cols(bike_train %>% select(.data[[.var]])) %>% 
+		pivot_longer(cols = temp_tr:temp,
+						 names_to = "variable",
+						 values_to = "valores") %>% 
+		ggplot(aes(x = valores, y = ..density..)) +
+		geom_histogram(fill   = "#56B4E9",
+		                 colour = "black",
+		                 size   = .2) +
+		geom_density(size = 1) +
+		facet_wrap(variable ~ ., scales = "free")
+	
+}
+
+bike_transformado %>% 
+	select(temp_tr = temp) %>% 
+	bind_cols(bike_train %>% select(temp)) %>% 
+	pivot_longer(cols = temp_tr:temp,
+					 names_to = "variable",
+					 values_to = "valores") %>% 
+	ggplot(aes(x = valores, y = ..density..)) +
+	geom_histogram(fill   = "#56B4E9",
+	                 colour = "black",
+	                 size   = .2) +
+	geom_density(size = 1) +
+	facet_wrap(variable ~ ., scales = "free")
+	
+```
+
+
+```{r}
+par(mfrow = c(1,1))
+plot(density(bike_train$temp), main = "before")
+plot(density(aplicar_receta$temp), main = "after")
+```
+
+
+## XGBoost
+
+```{r}
+xgboost_spec <- boost_tree(
+	tree_depth = tune(),
+	learn_rate = tune(),
+	loss_reduction = tune(),
+	min_n = tune(),
+	sample_size = tune(),
+	trees = tune()
+) %>%
+	set_engine("xgboost") %>%
+	set_mode("regression")
+```
+
+Si bien los métodos de boosting basados en árboles generalmente no requieren la
+creación de variables ficticias (dummy), los modelos que usan el **motor xgboost
+sí lo requieren.**
+
+Este modelo requiere que los predictores sean numéricos. El método más común
+para convertir predictores cualitativos en numéricos es crear variables
+indicadoras binarias (también conocidas como variables ficticias) a partir de
+estos predictores. Sin embargo, para este modelo, se pueden crear variables
+indicadoras binarias para cada uno de los niveles de los factores (conocido como
+'codificación one-hot').
+
+```{r}
+receta_xgboost <- recipe(formula = cnt ~ ., data = bike_train) %>% 
+  step_novel(all_nominal(), -all_outcomes()) %>% 
+  step_dummy(all_nominal(), -all_outcomes(), one_hot = TRUE) %>% 
+  step_zv(all_predictors()) 
+```
+
+La función `step_dummy()` hace lo mismo que la función `dummyVars()` y en
+conjunto con la función _helper_ `all_nominal()` realizar la conversión de las
+variables de tipo factor a binarias.  Esta transformación es análoga a lo
+expresado en [@formacion_modelos_2020] en que indicamos explícitamente que la
+variable respuesta se quede sin transformar.
+
+Con `step_zv()` vamos a comprobar que no existen variables con varianza cero y
+si las hay las elimina.
+
+El centrado y escalado de las variables no es requerido para _xgboost_
+
+## Workflowset
+
+Workflowsets sirve para crear y evaluar combinaciones de elementos de modelado.
+
+```{r}
+preprocesadores <- list(simple = receta_rf, normal = receta_xgboost)
+modelos         <- list(rf = rf_spec, xg = xgboost_spec)
+```
+
+```{r}
+bike_set <- workflow_set(preprocesadores, modelos, cross = FALSE)
+```
+
+Usamos `cross = FALSE`  porque no queremos todas las combinaciones de estos
+componentes, solo dos opciones para probar. Adaptemos estos posibles candidatos
+a nuestras muestras para ver cuál funciona mejor
+
+```{r, paged.print = FALSE}
+bike_set
+```
+
+La columna `option` se utiliza en caso de que hubiésemos agregado opciones a
+algunos de los modelos. La columna `result` indica si se ha optimizado los
+parámetros de los modelos. En este caso, en la definición de las recetas, tanto
+para RF como para XG hemos aplicado las función `tune()` del paquete del mismo
+nombre.  
+
+Comenzaremos definiendo el set de métricas que utilizaremos para evaluar los
+modelos.
+
+```{r}
+mset <- metric_set(rmse, rsq)
+```
+
+Utilizaremos el método de carrera (*racing*) para hacer más eficiente el proceso
+de búsqueda de hiperparámetros óptimos. Este método evalúa de forma gradual las
+re-muestras. 
+
+```{r}
+race_ctrl <- control_race(
+      save_pred     = TRUE,
+      parallel_over = "everything",
+      save_workflow = TRUE)
+```
+
+Ahora aplicaremos la función `workflow_map` para aplicar cada modelo a su receta
+correspondiente dentro de cada pliego (fold).
+
+```{r}
+doParallel::registerDoParallel(cores = 12)
+set.seed(2021)
+```
+
+
+```{r}
+wflow_set <- bike_set %>%
+  workflow_map(
+  	"tune_race_anova",
+    resamples = bike_fold,
+    grid = 20,
+    control = race_ctrl,
+    metrics = mset,
+    seed = 3,
+    verbose = TRUE)
+```
+
+```{r, paged.print = FALSE}
+wflow_set
+```
+
+Vemos que las columnas `option` y `result` se han actualizado. La columna
+`result` en particular ahora muestra que los parámetros de los modelos fueron
+*tuneados*. El símbolo [+] indica que no hay ningún problema presente con los
+objetos creados.
+
+Veamos cuantos modelos fueron ajustados:
+
+```{r}
+nrow(collect_metrics(wflow_set, summarize = FALSE))
+```
+
+La función `rank_results()` ordenará los modelos la métrica de
+rendimiento que definamos. De forma predeterminada, utiliza la primera métrica
+del conjunto de métricas definido previamente (RMSE en este caso).
+
+```{r}
+wflow_set %>% rank_results() %>% head()
+```
+
+También podemos ver esto gráficamente, dejando que se muestren únicamente los
+mejores ajustes para cada modelo.
+
+```{r, fig.width=13, fig.asp=0.4}
+autoplot(wflow_set, select_best = TRUE) + drako
+```
+
+<p class="comment">
+El menor RMSE corresponde a Random Forest y el mayor $R^{2}$ corresponde también
+a RF.
+</p>
+
+```{r, paged.print = FALSE}
+wflow_set %>% extract_workflow_set_result("simple_rf")
+```
+
+
+## Finalizar el modelo
+
+El primer paso es elegir un flujo de trabajo para finalizar. Dado que el modelo
+Random Forest funcionó bien, lo extraeremos del conjunto, actualizaremos los
+parámetros con la mejor configuración numérica y los ajustaremos al conjunto de
+entrenamiento:
+
+```{r}
+best_results <- wflow_set %>% 
+   extract_workflow_set_result("simple_rf") %>% 
+   select_best(metric = "rmse")
+```
+
+```{r, paged.print = FALSE}
+best_results
+```
+
+Con la función `last_fit()` ajustaremos el RF finalizado una última vez a los
+datos de entrenamiento y evaluaremos por última vez los datos de prueba.
+
+```{r}
+rf_test_results <- wflow_set %>% 
+   extract_workflow("simple_rf") %>% 
+   finalize_workflow(best_results) %>% 
+   last_fit(split = bike_split)
+```
+
+```{r, paged.print = FALSE}
+rf_test_results %>% collect_metrics()
+```
+
+Veamos los valores reales contra los valores ajustados.
+
+```{r}
+rf_test_results %>% 
+	collect_predictions() %>% 
+	ggplot(aes(x = cnt, y = .pred)) + 
+   geom_abline(col = "green", lty = 2) + 
+   geom_point(alpha = 0.5) + 
+   coord_obs_pred() + 
+   labs(x = "observed", y = "predicted") +
+	drako
+```
+
+Con esta gráfica nos damos una idea del nivel de precisión que logramos con
+este modelo. Entre más cercana esté la nube de puntos a la diagonal en verde,
+mayor precisión. Es decir una nube con menos dispersión alrededor de la diagonal
+será mejor.  Podemos ver que algunos puntos específicos se encuentran notablemente
+más alejados de la diagonal, por lo que habrá que realizar un EDA para intentar
+realizar más ajustes de preprocesamiento de ser necesario.
+
+También podemos ver los parámetros del modelo para saber como quedaron los
+hiperparámetros del modelo final seleccionado.
+
+```{r, paged.print = FALSE}
+rf_test_results %>% extract_fit_parsnip()
+```
+
+`r resaltar("El nivel óptimo que minimiza el OOB error se obtiene con 5
+variables. Hemos creado un modelo que obtiene una tasa de error en OOB de")`
+
+
+# Resultados
+
+Para efectos de poder calcular el RMSLE definido en el apartado [Métricas](##Metricas)
+en la parte inicial de este documento realizaremos lo siguiente:
+
+```{r}
+mi_metrica <- rf_test_results$.predictions[[1]] %>% 
+	select(.pred, cnt)
+```
+
+`r resaltar("El objetivo de extraer el RMSLE es para poder comparar que tan
+bien lo hicimos en comparación con los resultados de las competencias de Kaggle.
+RMSE es una métrica perfectamente válida, sin embargo, la mayoría o casi todos
+los resultados encontrados son expresados en RMSLE por la razón explicada
+en el apartado inicial.")`
+
+```{r, paged.print = FALSE}
+tt <- collect_metrics(rf_test_results) %>% 
+	select(-.config) %>% 
+	bind_rows(mi_metrica %>% rmsle(cnt, .pred)) %>% 
+	select(-.estimator) 
+```
+
+```{r, echo=FALSE}
+tt %>% tabla(cap = "Métricas del mejor modelo")
+```
+
+```{r, echo=FALSE}
+tf <- tt %>% filter(.metric == "rmsle") %>% pull(.estimate)
+```
+
+<p class="comment">
+Vemos que el mejor RMSLE es de `r tf`. `r resaltar("Este valor NO es tan bueno
+como el encontrado en las competencias de Kaggle para este mismo dataset en el
+cual se reportan valores de hasta 0.15 de RMSLE en los primeros lugares")`
+</p>
+
+<p class="comment">
+El RMSE es de 1194 bicicletas rentadas por día. 
+</p>
+
+# Importancia Relativa
+
+Ahora procedamos a revisar la importancia de las variables para este modelo.
+
+```{r}
+imp_spec <- rf_spec %>% 
+	finalize_model(best_results) %>% 
+	set_engine("ranger", importance = "permutation")
+```
+
+```{r}
+workflow() %>%
+  add_recipe(receta_rf) %>% 
+  add_model(imp_spec) %>%
+  fit(bike_train) %>% 
+  pull_workflow_fit() %>%
+  vip(aesthetics = list(alpha = 0.8, fill = "midnightblue"))
+```
+
+
+<p class="comment">
+`r resaltar("Estos resultados son consistentes con lo encontrado en el EDA al
+inicio de este documento, en donde observamos que la temperatura y la humedad
+parecían ser muy relevantes como predictores de la cantidad de bicicletas
+rentadas.")`
+</p>
+
+
+
+
+# Referencias
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
