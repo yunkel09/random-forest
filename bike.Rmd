@@ -1007,7 +1007,6 @@ a RF.
 wflow_set %>% extract_workflow_set_result("simple_rf")
 ```
 
-
 ## Finalizar el modelo
 
 El primer paso es elegir un flujo de trabajo para finalizar. Dado que el modelo
