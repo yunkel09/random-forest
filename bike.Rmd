@@ -114,8 +114,8 @@ import::from("janitor", make_clean_names)
 pacman::p_load(colorspace,
 					colorblindr,
 					kableExtra,
+					bestNormalize,
 					textrecipes,
-					# tictoc,
 					rlang,
 					usemodels,
 					tidymodels,
@@ -782,9 +782,9 @@ Lo que significa que al momento de realizar el ajuste contra todos los pliegos
 búsqueda y encontrar la mejor combinación.
 
 A como mencionamos en el apartado de análisis exploratorio, lo mejor será
-probar los modelos con diferentes transformaciones, aunque sabemos que los
+probar los modelos con diferentes transformaciones, aunque sabemos que **los
 modelos basados en árboles son insensibles a las características de los
-predictores, realizaremos la pruebas para efectos didácticos. 
+predictores, realizaremos la pruebas para efectos didácticos. **
 
 * **receta_rf_simple:** Todos los predictores sin transformaciones.
 
@@ -799,10 +799,15 @@ predictores.
 
 ```{r}
 receta_rf <- recipe(cnt ~ ., data = bike_train)
+```
 
+
+```{r}
 receta_rf_ce <- recipe(cnt ~ ., data = bike_train) %>% 
 	step_normalize(all_numeric_predictors())
 ```
+
+### Corrección de asimetría
 
 Trataremos de identificar la mejor transformación para cada predictor
 utilizando el paquete {bestNormalize} ([@R-bestNormalize]) el cual es posible
@@ -814,47 +819,57 @@ artículo de [@bestNormalize2021]
 bike_transformado <- recipe(cnt ~ ., data = bike_train) %>%
 	step_best_normalize(all_predictors(), -all_nominal()) %>%  
 	prep(bike_train) %>% 
-   bake(bike_train)
+    bake(bike_train) %>% 
+	rename_with(~ str_c(.x, "_tr"), is.double) %>% 
+	select(where(is.double)) %>% 
+	bind_cols(bike_train %>% select(where(is.double)))
 ```
 
-```{r}
-validar_transformacion <- function(.df, .var) {
-	
-	.df %>% 
-		select(temp_tr = .data[[.var]]) %>% 
-		bind_cols(bike_train %>% select(.data[[.var]])) %>% 
-		pivot_longer(cols = temp_tr:temp,
+(ref:predtr) Corrección de asimetría
+
+```{r, predtr, fig.cap='(ref:predtr)', fig.width=10, fig.asp=0.9}
+bike_transformado %>% 
+	pivot_longer(cols = temp_tr:windspeed,
 						 names_to = "variable",
 						 values_to = "valores") %>% 
-		ggplot(aes(x = valores, y = ..density..)) +
-		geom_histogram(fill   = "#56B4E9",
-		                 colour = "black",
-		                 size   = .2) +
-		geom_density(size = 1) +
-		facet_wrap(variable ~ ., scales = "free")
-	
-}
-
-bike_transformado %>% 
-	select(temp_tr = temp) %>% 
-	bind_cols(bike_train %>% select(temp)) %>% 
-	pivot_longer(cols = temp_tr:temp,
-					 names_to = "variable",
-					 values_to = "valores") %>% 
 	ggplot(aes(x = valores, y = ..density..)) +
 	geom_histogram(fill   = "#56B4E9",
-	                 colour = "black",
-	                 size   = .2) +
+		            colour = "black",
+		            size   = .2) +
 	geom_density(size = 1) +
-	facet_wrap(variable ~ ., scales = "free")
-	
+	facet_wrap(variable ~ ., scales = "free", ncol = 2) +
+	labs(title = "Predictores Transformados", subtitle = "BestNormalize") +
+	drako
+```
+
+En la figura \@ref(fig:predtr) vemos como el paquete {bestNormalize} seleccionó
+para cada predictor la transformación que da mejor resultado.  Ahora que hemos
+visto como quedan los predictores numéricos transformados, procedamos a realizar
+la transformación en la receta.
+
+```{r}
+receta_rf_cetr <- recipe(cnt ~ ., data = bike_train) %>%
+	step_best_normalize(all_predictors(), -all_nominal())
+```
+
+```{r}
+receta_rf_cetr %>% 
+	prep(bike_train) %>% bake(bike_train)
 ```
 
 
+
+
+
+
+Agregaremos algunos pasos de preprocesamiento adicionales. Con base a la figura
+\@ref(fig:desbalance) agregaremos `step_other()` para agrupar valores que
+ocurren con poca frecuencia y los pondrá en un categoría denominada "otros".
+
 ```{r}
-par(mfrow = c(1,1))
-plot(density(bike_train$temp), main = "before")
-plot(density(aplicar_receta$temp), main = "after")
+receta_rf_cetrplus <- recipe(cnt ~ ., data = bike_train) %>%
+	step_best_normalize(all_predictors(), -all_nominal()) %>% 
+	step_other(holiday, weathersit)
 ```
 
 
@@ -905,19 +920,52 @@ El centrado y escalado de las variables no es requerido para _xgboost_
 ## Workflowset
 
 Workflowsets sirve para crear y evaluar combinaciones de elementos de modelado.
+Debido a que no podremos combinar las recetas de RF con el motor de xgboost,
+tendremso que separar los *workflows*, realizar el *tuning* y luego unir para
+evaluar las métricas
 
 ```{r}
-preprocesadores <- list(simple = receta_rf, normal = receta_xgboost)
-modelos         <- list(rf = rf_spec, xg = xgboost_spec)
+preprocesadores_rf <- list(simple_rfr = receta_rf, 
+									centradosf = receta_rf_ce, 
+									asimetrias = receta_rf_cetr,
+									all_transf = receta_rf_cetrplus)
+```
+
+
+```{r}
+modelo_rf <- list(rf = rf_spec)
+```
+
+Usaremos `cross = TRUE` por defecto para que genere todas las combinaciones de
+estos componentes. Es decir, todas las recetas contra todos los modelos.
+
+```{r}
+bike_set_rf <- workflow_set(preprocesadores_rf, modelo_rf, cross = TRUE)
+```
+
+```{r, paged.print = FALSE}
+bike_set_rf
+```
+
+Vemos la combinación de todas los preprocesados y los modelos únicamente para
+RF.  Ahora lo mismo para xgboost
+
+```{r}
+preprocesadores_xg <- list(xgb_normal = receta_xgboost)
 ```
 
 ```{r}
-bike_set <- workflow_set(preprocesadores, modelos, cross = FALSE)
+modelo_xg <- list(xg = xgboost_spec)
 ```
 
-Usamos `cross = FALSE`  porque no queremos todas las combinaciones de estos
-componentes, solo dos opciones para probar. Adaptemos estos posibles candidatos
-a nuestras muestras para ver cuál funciona mejor
+```{r}
+bike_set_xg <- workflow_set(preprocesadores_xg, modelo_xg, cross = TRUE)
+```
+
+```{r}
+bike_set <- bike_set_rf %>% 
+	bind_rows(bike_set_xg)
+```
 
 ```{r, paged.print = FALSE}
 bike_set
@@ -951,7 +999,11 @@ Ahora aplicaremos la función `workflow_map` para aplicar cada modelo a su recet
 correspondiente dentro de cada pliego (fold).
 
 ```{r}
-doParallel::registerDoParallel(cores = 12)
+# doParallel::registerDoParallel(cores = 12)
+all_cores <- parallel::detectCores(logical = FALSE)
+cl <- makePSOCKcluster(all_cores)
+registerDoParallel(cl)
+
 set.seed(2021)
 ```
 
@@ -967,6 +1019,7 @@ wflow_set <- bike_set %>%
     seed = 3,
     verbose = TRUE)
 ```
+
 
 ```{r, paged.print = FALSE}
 wflow_set
