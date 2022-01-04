@@ -101,6 +101,8 @@ import::from(DescTools, JarqueBeraTest)
 import::from(vip, vip)
 import::from(statistigo, coloring_font)
 import::from(skimr, skim)
+import::from(parallel, detectCores, makePSOCKcluster, stopCluster)
+import::from(doParallel, registerDoParallel)
 import::from(weights, rd, starmaker)
 import::from(cowplot, .except = "stamp")
 import::from(kableExtra, .except = "group_rows")
@@ -244,6 +246,16 @@ resaltar <- function(texto) {
     
 }
 ```
+
+```{r}
+# detener el backend
+unregister <- function() {
+  env <- foreach:::.foreachGlobals
+  rm(list=ls(name=env), pos=env)
+}
+```
+
+
 
 ## Metricas
 
@@ -689,10 +701,9 @@ un buen predictor de la renta de bicicletas.**
 
 Hay algunos paquetes R existentes que proporcionan una interfaz unificada para
 armonizar para trabajar con Machine Learning, tales como caret y mlr. El marco
-tidymodels es similar a estos en la adopción de una unificación de la interfaz
-de función, así como en la aplicación de coherencia en los nombres de las
-funciones y los valores de retorno. Es diferente en sus obstinados objetivos de
-diseño e implementación de modelos.
+tidymodels es similar a estos en la adopción de una unificación de la interfaz,
+así como en la aplicación de coherencia en los nombres de las
+funciones y los valores de retorno. 
 
 <p class="comment">
 Se reconoce^[ver [usemodels](https://bit.ly/3s5tvW3)] que el uso de este marco
@@ -734,8 +745,8 @@ bike_fold <- vfold_cv(bike_train, strata = cnt)
 
 La explicación del porque estratificar la variable respuesta (numérica continua)
 es que debido a que no tiene una distribución normal si simplemente utilizamos
-muestreo aleatorio se podría dar el caso que los datos de entrenamiento los
-casos de cantidades de rentas extremas (altas o bajas) no estén bien
+muestreo aleatorio se podría dar el caso que en los datos de entrenamiento los
+casos de cantidades de rentas extremas (altas o bajas) no estarían bien
 representadas en este conjunto y por lo tanto la predicción de nuestro modelo
 será deficiente.
 
@@ -786,7 +797,7 @@ probar los modelos con diferentes transformaciones, aunque sabemos que **los
 modelos basados en árboles son insensibles a las características de los
 predictores, realizaremos la pruebas para efectos didácticos. **
 
-* **receta_rf_simple:** Todos los predictores sin transformaciones.
+* **receta_rf:** Todos los predictores sin transformaciones.
 
 * **receta_rf_ce:** Todos los predictores numéricos centrados y escalados.
 
@@ -801,7 +812,6 @@ predictores.
 receta_rf <- recipe(cnt ~ ., data = bike_train)
 ```
 
-
 ```{r}
 receta_rf_ce <- recipe(cnt ~ ., data = bike_train) %>% 
 	step_normalize(all_numeric_predictors())
@@ -814,6 +824,8 @@ utilizando el paquete {bestNormalize} ([@R-bestNormalize]) el cual es posible
 aplicar a través de la función `step_best_normalize` a como se define en el
 artículo de [@bestNormalize2021]
 
+Antes de construir la receta, veamos como quedarían los predictores numéricos
+con las correciones de asimetrías ya realizadas.
 
 ```{r}
 bike_transformado <- recipe(cnt ~ ., data = bike_train) %>%
@@ -847,19 +859,22 @@ para cada predictor la transformación que da mejor resultado.  Ahora que hemos
 visto como quedan los predictores numéricos transformados, procedamos a realizar
 la transformación en la receta.
 
+Algo muy importante de notar es que para que la receta funcione en los casos en
+que se utilice la función `step_best_normalize` es necesario aplicar la función
+`prep()` al final.  Aun no tenemos claridad del porque esto es necesario, pero
+el no hacerlo genera un error en el *workflow*.
+
 ```{r}
 receta_rf_cetr <- recipe(cnt ~ ., data = bike_train) %>%
-	step_best_normalize(all_predictors(), -all_nominal())
+	step_best_normalize(all_predictors(), -all_nominal()) %>% 
+	prep()
 ```
+
+Veamos como se ven los datos con los predictores numéricos ya transformados:
 
 ```{r}
-receta_rf_cetr %>% 
-	prep(bike_train) %>% bake(bike_train)
+receta_rf_cetr %>% prep(bike_train) %>% bake(bike_train)
 ```
-
-
-
-
 
 
 Agregaremos algunos pasos de preprocesamiento adicionales. Con base a la figura
@@ -869,9 +884,17 @@ ocurren con poca frecuencia y los pondrá en un categoría denominada "otros".
 ```{r}
 receta_rf_cetrplus <- recipe(cnt ~ ., data = bike_train) %>%
 	step_best_normalize(all_predictors(), -all_nominal()) %>% 
-	step_other(holiday, weathersit)
+	step_other(holiday, weathersit) %>% 
+	step_nzv(all_predictors()) %>% 
+	prep()
 ```
 
+
+```{r}
+receta_rf_cetrplus %>% prep(bike_train) %>% bake(bike_train)
+```
+
+Vemos que el filtro de `step_nzv` eliminó la variable *holiday*.
 
 ## XGBoost
 
@@ -921,12 +944,12 @@ El centrado y escalado de las variables no es requerido para _xgboost_
 
 Workflowsets sirve para crear y evaluar combinaciones de elementos de modelado.
 Debido a que no podremos combinar las recetas de RF con el motor de xgboost,
-tendremso que separar los *workflows*, realizar el *tuning* y luego unir para
+tendremos que separar los *workflows*, realizar el *tuning* y luego unir para
 evaluar las métricas
 
 ```{r}
 preprocesadores_rf <- list(simple_rfr = receta_rf, 
-									centradosf = receta_rf_ce, 
+									centradosf = receta_rf_ce,
 									asimetrias = receta_rf_cetr,
 									all_transf = receta_rf_cetrplus)
 ```
@@ -948,7 +971,7 @@ bike_set_rf
 ```
 
 Vemos la combinación de todas los preprocesados y los modelos únicamente para
-RF.  Ahora lo mismo para xgboost
+RF.  Ahora lo mismo para XGBoost
 
 ```{r}
 preprocesadores_xg <- list(xgb_normal = receta_xgboost)
@@ -998,18 +1021,24 @@ race_ctrl <- control_race(
 Ahora aplicaremos la función `workflow_map` para aplicar cada modelo a su receta
 correspondiente dentro de cada pliego (fold).
 
+
 ```{r}
-# doParallel::registerDoParallel(cores = 12)
-all_cores <- parallel::detectCores(logical = FALSE)
+# Crear un cluster con sesiones de R para agregar paralelismo
+# Reduce de 8.5 min a 1.66 min el tiempo de procesamiento de los modelos
+all_cores <- detectCores(logical = FALSE)
 cl <- makePSOCKcluster(all_cores)
 registerDoParallel(cl)
-
 set.seed(2021)
 ```
 
+El tamaño de la cuadrícula es un poco arbitrario. En este caso decidimos colocar
+20, pero también pudimos haber creado una cuadrícula con los valores de MTRY y
+n_trees que consideremos. Una razón para no hacer esto es que tendríamos que
+realizar por separado el tuning de los parámetros de XGBoost, es decir, crear
+una cuadrícula para RF y otra para XGBoost.
 
 ```{r}
-wflow_set <- bike_set %>%
+tune_res <- bike_set %>%
   workflow_map(
   	"tune_race_anova",
     resamples = bike_fold,
@@ -1020,9 +1049,14 @@ wflow_set <- bike_set %>%
     verbose = TRUE)
 ```
 
+```{r}
+# muy importante detener el cluster y eliminar variables asociadas.
+stopCluster(cl)
+unregister()
+```
 
 ```{r, paged.print = FALSE}
-wflow_set
+tune_res
 ```
 
 Vemos que las columnas `option` y `result` se han actualizado. La columna
@@ -1033,32 +1067,58 @@ objetos creados.
 Veamos cuantos modelos fueron ajustados:
 
 ```{r}
-nrow(collect_metrics(wflow_set, summarize = FALSE))
+nrow(collect_metrics(tune_res, summarize = FALSE))
 ```
 
 La función `rank_results()` ordenará los modelos la métrica de
 rendimiento que definamos. De forma predeterminada, utiliza la primera métrica
 del conjunto de métricas definido previamente (RMSE en este caso).
 
-```{r}
-wflow_set %>% rank_results() %>% head()
+```{r, rmse-train, paged.print = FALSE}
+tune_res %>%
+	rank_results(select_best = TRUE) %>% 
+	filter(.metric == "rmse") %>% 
+	select(modelo = wflow_id, .config, rmse = mean, rank) %>% 
+	tabla(cap = "Ajuste RMSE con datos de entrenamiento")
 ```
+
+```{r, echo=FALSE}
+rmse_train <- tune_res %>%
+	rank_results(select_best = TRUE) %>% 
+	filter(.metric == "rmse") %>% 
+	select(modelo = wflow_id, .config, rmse = mean, rank) %>% 
+	filter(modelo == "simple_rfr_rf") %>% 
+	pull(rmse)
+```
+
+
+A parte de que vemos de que Random Forest se ajustó mejor que XGBoost, vemos que
+prácticamente no hay diferencias significativas en el resultado obtenido con los
+preprocesamientos adicionales y el ajuste de RF sin procesar. Así que
+seleccionaremos el modelo sin preprocesamiento, el cual obtuvo un RMSE de
+`r round(rmse_train, 2)`
 
 También podemos ver esto gráficamente, dejando que se muestren únicamente los
 mejores ajustes para cada modelo.
 
 ```{r, fig.width=13, fig.asp=0.4}
-autoplot(wflow_set, select_best = TRUE) + drako
+autoplot(tune_res, select_best = TRUE) + drako
+```
+
+Seleccionemos el Random Forest simple para ver como quedaron sus parámetros.
+
+(ref:valoresx) Mejores valores de `mtry` y `min_n`
+
+```{r, valoresx, fig.cap='(ref:valoresx)', fig.width=12, fig.asp=0.9}
+autoplot(tune_res, select_best = TRUE, id = "simple_rfr_rf") + 
+	labs(title = "Random Forest Simple", subtitle = "Sin preprocesamiento") +
+	drako
 ```
 
 <p class="comment">
-El menor RMSE corresponde a Random Forest y el mayor $R^{2}$ corresponde también
-a RF.
+En la gráfica \@ref(fig:valoresx) podemos ver los diferentes valores de RMSE para
+cada combinación de `mtry` y de `ntree` con base al número de remuestreos.
 </p>
-
-```{r, paged.print = FALSE}
-wflow_set %>% extract_workflow_set_result("simple_rf")
-```
 
 ## Finalizar el modelo
 
@@ -1068,8 +1128,8 @@ parámetros con la mejor configuración numérica y los ajustaremos al conjunto 
 entrenamiento:
 
 ```{r}
-best_results <- wflow_set %>% 
-   extract_workflow_set_result("simple_rf") %>% 
+best_results <- tune_res %>% 
+   extract_workflow_set_result("simple_rfr_rf") %>% 
    select_best(metric = "rmse")
 ```
 
@@ -1077,21 +1137,46 @@ best_results <- wflow_set %>%
 best_results
 ```
 
+```{r, include=FALSE}
+aa <- best_results$mtry
+ab <- best_results$min_n
+```
+
+Esto es consistente con lo que vimos en la gráfica. Los mejores parámetros del
+modelo funcionan bien con `r aa` para el `mtry` y `r ab` para el `min_n`
+
 Con la función `last_fit()` ajustaremos el RF finalizado una última vez a los
 datos de entrenamiento y evaluaremos por última vez los datos de prueba.
 
 ```{r}
-rf_test_results <- wflow_set %>% 
-   extract_workflow("simple_rf") %>% 
+rf_test_results <- tune_res %>% 
+   extract_workflow("simple_rfr_rf") %>% 
    finalize_workflow(best_results) %>% 
    last_fit(split = bike_split)
 ```
 
 ```{r, paged.print = FALSE}
-rf_test_results %>% collect_metrics()
+rf_test_results %>%
+	collect_metrics() %>% 
+	tabla(cap = "Ajuste RMSE con datos de prueba")
+```
+
+```{r, echo=FALSE}
+rmse_prueba <- rf_test_results %>%
+	collect_metrics() %>% 
+	filter(.metric == "rmse") %>% 
+	pull(.estimate)
 ```
 
 Veamos los valores reales contra los valores ajustados.
+
+<p class="comment">
+En la tabla \@ref(tab:rmse-train) vimos que el RMSE para los datos de
+entrenamiento fue de `r round(rmse_train, 2)` y con los datos de prueba
+obtuvimos un valor de `r round(rmse_prueba, 2)`, lo cual nos da una diferencia
+de `r round(rmse_prueba - rmse_train)` Debido a que esta diferencia no es tan
+grande no podríamos decir de que tenemos un sobre-ajuste (overfitting).
+</p>
 
 ```{r}
 rf_test_results %>% 
@@ -1118,9 +1203,6 @@ hiperparámetros del modelo final seleccionado.
 rf_test_results %>% extract_fit_parsnip()
 ```
 
-`r resaltar("El nivel óptimo que minimiza el OOB error se obtiene con 5
-variables. Hemos creado un modelo que obtiene una tasa de error en OOB de")`
-
 
 # Resultados
 
@@ -1138,7 +1220,7 @@ RMSE es una métrica perfectamente válida, sin embargo, la mayoría o casi todo
 los resultados encontrados son expresados en RMSLE por la razón explicada
 en el apartado inicial.")`
 
-```{r, paged.print = FALSE}
+```{r}
 tt <- collect_metrics(rf_test_results) %>% 
 	select(-.config) %>% 
 	bind_rows(mi_metrica %>% rmsle(cnt, .pred)) %>% 
@@ -1154,13 +1236,13 @@ tf <- tt %>% filter(.metric == "rmsle") %>% pull(.estimate)
 ```
 
 <p class="comment">
-Vemos que el mejor RMSLE es de `r tf`. `r resaltar("Este valor NO es tan bueno
+Vemos que el mejor RMSLE es de `r round(tf, 2)`. `r resaltar("Este valor NO es tan bueno
 como el encontrado en las competencias de Kaggle para este mismo dataset en el
 cual se reportan valores de hasta 0.15 de RMSLE en los primeros lugares")`
 </p>
 
 <p class="comment">
-El RMSE es de 1194 bicicletas rentadas por día. 
+El RMSE es de `r round(tt$.estimate[1], 2)` bicicletas rentadas por día. 
 </p>
 
 # Importancia Relativa
@@ -1187,10 +1269,8 @@ workflow() %>%
 `r resaltar("Estos resultados son consistentes con lo encontrado en el EDA al
 inicio de este documento, en donde observamos que la temperatura y la humedad
 parecían ser muy relevantes como predictores de la cantidad de bicicletas
-rentadas.")`
+rentadas.")`. Partial Least Squares
 </p>
-
-
 
 
 # Referencias
